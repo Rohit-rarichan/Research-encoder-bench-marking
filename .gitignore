@@ -1,8 +1,12 @@
+datasets/
 .venv/
 __pycache__/
 v2x-subset/
+nuImages/
 nuscenes/
 *.zip
 *.tar.gz
 *.tgz
 *.png
+*LICENSE
+*.pth

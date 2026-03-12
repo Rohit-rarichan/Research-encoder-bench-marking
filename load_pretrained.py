@@ -16,8 +16,8 @@ from transformers import SegformerForSemanticSegmentation
 def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-512-512"):
     """
     Transfers weights from a HuggingFace SegFormer checkpoint into a
-    SegformerClasswise instance.  Returns a list of any keys that could
-    not be mapped (should be empty for B0 / 150-class models).
+    SegformerClasswise instance. Returns a list of any keys that could
+    not be mapped.
     """
     hf = SegformerForSemanticSegmentation.from_pretrained(hf_id)
     hf_sd = hf.state_dict()
@@ -27,7 +27,7 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
     unmapped = []
 
     # ------------------------------------------------------------------ #
-    #  Helper                                                              #
+    # Helper
     # ------------------------------------------------------------------ #
     def copy(my_key, hf_key):
         if hf_key not in hf_sd:
@@ -43,7 +43,7 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
         new_sd[my_key] = h
 
     # ------------------------------------------------------------------ #
-    #  Encoder — patch embeddings                                         #
+    # Encoder — patch embeddings
     # ------------------------------------------------------------------ #
     for i in range(4):
         pfx_hf = f"segformer.encoder.patch_embeddings.{i}"
@@ -54,7 +54,7 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
         copy(f"{pfx_my}.norm.bias",     f"{pfx_hf}.layer_norm.bias")
 
     # ------------------------------------------------------------------ #
-    #  Encoder — transformer blocks                                        #
+    # Encoder — transformer blocks
     # ------------------------------------------------------------------ #
     depths = (2, 2, 2, 2)
     for i in range(4):
@@ -72,19 +72,19 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
             copy(f"{pfx_my}.attn.q.weight", f"{pfx_hf}.attention.self.query.weight")
             copy(f"{pfx_my}.attn.q.bias",   f"{pfx_hf}.attention.self.query.bias")
 
-            # attention — KV  (HF stores K and V separately; we concatenate)
+            # attention — KV (HF stores K and V separately; we concatenate)
             k_w = hf_sd[f"{pfx_hf}.attention.self.key.weight"]
             v_w = hf_sd[f"{pfx_hf}.attention.self.value.weight"]
             k_b = hf_sd[f"{pfx_hf}.attention.self.key.bias"]
             v_b = hf_sd[f"{pfx_hf}.attention.self.value.bias"]
-            new_sd[f"{pfx_my}.attn.kv.weight"] = torch.cat([k_w, v_w], dim=0)  # [2*dim, dim]
-            new_sd[f"{pfx_my}.attn.kv.bias"]   = torch.cat([k_b, v_b], dim=0)  # [2*dim]
+            new_sd[f"{pfx_my}.attn.kv.weight"] = torch.cat([k_w, v_w], dim=0)
+            new_sd[f"{pfx_my}.attn.kv.bias"]   = torch.cat([k_b, v_b], dim=0)
 
             # attention — output projection
             copy(f"{pfx_my}.attn.proj.weight", f"{pfx_hf}.attention.output.dense.weight")
             copy(f"{pfx_my}.attn.proj.bias",   f"{pfx_hf}.attention.output.dense.bias")
 
-            # attention — sequence reduction (sr) conv + norm (only when sr_ratio > 1)
+            # attention — sequence reduction (sr) conv + norm
             sr_key = f"{pfx_hf}.attention.self.sr.weight"
             if sr_key in hf_sd:
                 copy(f"{pfx_my}.attn.sr.weight",   f"{pfx_hf}.attention.self.sr.weight")
@@ -101,14 +101,14 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
             copy(f"{pfx_my}.mlp.dwconv.bias",   f"{pfx_hf}.mlp.dwconv.dwconv.bias")
 
     # ------------------------------------------------------------------ #
-    #  Encoder — stage layer norms                                        #
+    # Encoder — stage layer norms
     # ------------------------------------------------------------------ #
     for i in range(4):
         copy(f"encoder.stage_norms.{i}.weight", f"segformer.encoder.layer_norm.{i}.weight")
         copy(f"encoder.stage_norms.{i}.bias",   f"segformer.encoder.layer_norm.{i}.bias")
 
     # ------------------------------------------------------------------ #
-    #  Decoder — per-scale MLP projections                                #
+    # Decoder — per-scale MLP projections
     # ------------------------------------------------------------------ #
     for i in range(4):
         copy(f"decode_head.mlp_projections.{i}.proj.weight",
@@ -117,14 +117,12 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
              f"decode_head.linear_c.{i}.proj.bias")
 
     # ------------------------------------------------------------------ #
-    #  Decoder — fusion layer                                             #
-    #  HF uses Conv2d(kernel=1) → weight shape [C_out, C_in, 1, 1]       #
-    #  Our fuse_mlp[0] uses nn.Linear  → weight shape [C_out, C_in]      #
-    #  Fix: squeeze the trailing spatial dims                             #
+    # Decoder — fusion layer
+    # HF uses Conv2d(kernel=1) → weight shape [C_out, C_in, 1, 1]
+    # Our fuse_mlp[0] uses nn.Linear → weight shape [C_out, C_in]
     # ------------------------------------------------------------------ #
-    fuse_w_hf = hf_sd["decode_head.linear_fuse.weight"]   # [256, 1024, 1, 1]
-    new_sd["decode_head.fuse_mlp.0.proj.weight"] = fuse_w_hf.squeeze(-1).squeeze(-1)  # [256, 1024]
-    # HF linear_fuse has no bias (bias=False); our Linear has no bias either — nothing to copy
+    fuse_w_hf = hf_sd["decode_head.linear_fuse.weight"]
+    new_sd["decode_head.fuse_mlp.0.proj.weight"] = fuse_w_hf.squeeze(-1).squeeze(-1)
 
     # BatchNorm after fuse
     copy("decode_head.fuse_mlp.1.weight",       "decode_head.batch_norm.weight")
@@ -135,13 +133,15 @@ def load_pretrained_hf(model, hf_id: str = "nvidia/segformer-b0-finetuned-ade-51
          "decode_head.batch_norm.num_batches_tracked")
 
     # ------------------------------------------------------------------ #
-    #  Decoder — classifier                                               #
+    # Decoder — classifier
+    # Commented out so custom class counts (e.g. 7 classes) keep a random
+    # classifier head instead of trying to load the 150-class ADE head.
     # ------------------------------------------------------------------ #
-    copy("decode_head.classifier.weight", "decode_head.classifier.weight")
-    copy("decode_head.classifier.bias",   "decode_head.classifier.bias")
+    # copy("decode_head.classifier.weight", "decode_head.classifier.weight")
+    # copy("decode_head.classifier.bias",   "decode_head.classifier.bias")
 
     # ------------------------------------------------------------------ #
-    #  Load into model                                                     #
+    # Load into model
     # ------------------------------------------------------------------ #
     missing, unexpected = model.load_state_dict(new_sd, strict=False)
 

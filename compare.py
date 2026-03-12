@@ -9,7 +9,7 @@ from load_pretrained import load_pretrained_hf
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── My model (random weights) ──────────────────────────────────────────────
-model = SegformerClasswise(num_classes=150)
+model = SegformerClasswise(num_classes=7)    #change back to 150 after nuscenes is done
 load_pretrained_hf(model, "nvidia/segformer-b0-finetuned-ade-512-512")
 model = model.to(device).eval()
 
