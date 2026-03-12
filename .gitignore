@@ -8,5 +8,6 @@ nuscenes/
 *.tar.gz
 *.tgz
 *.png
+*.jpg
 *LICENSE
 *.pth
