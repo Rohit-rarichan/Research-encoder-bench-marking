@@ -1,91 +1,227 @@
-import os
+"""
+train_nuimages.py — Train all encoder+UPerNet models on NuImages mini.
+
+Usage:
+    # Single model
+    python train_nuimages.py --model resnet101 --data_root /path/to/nuimages-v1.0-mini
+
+    # All models sequentially
+    python train_nuimages.py --model all --data_root /path/to/nuimages-v1.0-mini
+
+    # Recommended for lab server (GPU, full run):
+    python train_nuimages.py --model all --data_root /path/to/nuimages-v1.0-mini \\
+        --epochs 40 --batch_size 8 --img_size 512
+"""
+
+import argparse
+import json
+from pathlib import Path
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-from transformers import SegformerImageProcessor
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
+from nuimages_dataset import NuImagesDataset, NUM_CLASSES, CLASSES
+from metrics import SegmentationMetrics
+
+# Import all model classes
 from segformer import SegformerClasswise
-from load_pretrained import load_pretrained_hf
-from nuimages_dataset import NuImagesMiniDataset
+from segformer_upernet import SegformerUPerNet
+from resnet101_upernet import ResNet101UPerNet
+from swin_upernet import SwinBUPerNet
+from convnext_upernet import ConvNeXtBUPerNet
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATAROOT = os.path.expanduser("~/dev/research/datasets/nuImages")
-HF_ID = "nvidia/segformer-b0-finetuned-ade-512-512"
-NUM_CLASSES = 7
-IGNORE_INDEX = 255
-BATCH_SIZE = 4
-EPOCHS = 10
-LR = 1e-4
 
-processor = SegformerImageProcessor.from_pretrained(HF_ID)
+# ── Model registry ────────────────────────────────────────────────────────────
 
-class NuImagesTorchDataset(Dataset):
-    def __init__(self, dataroot):
-        self.base = NuImagesMiniDataset(dataroot)
+def build_model(name, num_classes):
+    """Build model by name."""
+    if name == "segformer":
+        # MiT-B0 + MLP decoder (Rohit's original)
+        return SegformerClasswise(
+            num_classes=num_classes,
+            embed_dims=(32, 64, 160, 256),
+            num_heads=(1, 2, 5, 8),
+            depths=(2, 2, 2, 2),
+            sr_ratios=(8, 4, 2, 1),
+        )
+    elif name == "segformer_upernet":
+        # MiT-B0 + UPerNet decoder
+        return SegformerUPerNet(num_classes=num_classes)
+    elif name == "resnet101":
+        return ResNet101UPerNet(num_classes=num_classes)
+    elif name == "swin_b":
+        return SwinBUPerNet(num_classes=num_classes)
+    elif name == "convnext_b":
+        return ConvNeXtBUPerNet(num_classes=num_classes)
+    else:
+        raise ValueError(f"Unknown model: {name}")
 
-    def __len__(self):
-        return len(self.base)
 
-    def __getitem__(self, idx):
-        sample = self.base[idx]
-        image = Image.open(sample["img_path"]).convert("RGB")
-        mask = sample["mask"]
+MODEL_NAMES = ["segformer", "segformer_upernet", "resnet101", "swin_b", "convnext_b"]
 
-        proc = processor(images=image, return_tensors="pt")
-        pixel_values = proc["pixel_values"].squeeze(0)   # [3, H, W]
 
-        mask = torch.tensor(mask, dtype=torch.long)
+# ── Device ────────────────────────────────────────────────────────────────────
 
-        return {
-            "pixel_values": pixel_values,
-            "labels": mask
-        }
+def get_device():
+    if torch.cuda.is_available():
+        print("Device: CUDA")
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        print("Device: Apple MPS")
+        return torch.device("mps")
+    print("Device: CPU (training will be slow)")
+    return torch.device("cpu")
 
-def collate_fn(batch):
-    pixel_values = torch.stack([x["pixel_values"] for x in batch])
-    labels = torch.stack([x["labels"] for x in batch])
-    return {"pixel_values": pixel_values, "labels": labels}
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    criterion  = nn.CrossEntropyLoss(ignore_index=255)
+    total_loss = 0.0
+    for imgs, masks in tqdm(loader, desc="  train", leave=False):
+        imgs, masks = imgs.to(device), masks.to(device)
+        optimizer.zero_grad()
+        logits = model(imgs)
+        loss   = criterion(logits, masks)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    criterion  = nn.CrossEntropyLoss(ignore_index=255)
+    total_loss = 0.0
+    metrics    = SegmentationMetrics(NUM_CLASSES, class_names=CLASSES)
+    for imgs, masks in tqdm(loader, desc="  eval ", leave=False):
+        imgs, masks = imgs.to(device), masks.to(device)
+        logits      = model(imgs)
+        total_loss += criterion(logits, masks).item()
+        metrics.update(logits.argmax(dim=1), masks)
+    return total_loss / len(loader), metrics.compute()
+
+
+# ── Per-model training run ────────────────────────────────────────────────────
+
+def train_model(model_name, args, device):
+    print(f"\n{'='*60}")
+    print(f"  Model  : {model_name}")
+    print(f"  Epochs : {args.epochs}  |  BS : {args.batch_size}  |  LR : {args.lr}")
+    print(f"{'='*60}")
+
+    pin          = device.type == "cuda"
+    train_ds     = NuImagesDataset(args.data_root, split="train", img_size=args.img_size)
+    val_ds       = NuImagesDataset(args.data_root, split="val",   img_size=args.img_size)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True,  num_workers=4, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                              shuffle=False, num_workers=4, pin_memory=pin)
+
+    model     = build_model(model_name, NUM_CLASSES).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs)
+
+    out_dir = Path(args.output_dir) / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    best_miou    = 0.0
+    best_results = None
+    history      = []
+
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        train_loss            = train_one_epoch(model, train_loader, optimizer, device)
+        val_loss, val_results = evaluate(model, val_loader, device)
+        scheduler.step()
+
+        miou = val_results["miou"]
+        print(f"  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  mIoU={miou:.4f}")
+        history.append({"epoch": epoch+1, "train_loss": train_loss,
+                        "val_loss": val_loss, "miou": miou})
+
+        if miou > best_miou:
+            best_miou    = miou
+            best_results = val_results
+            torch.save(model.state_dict(), out_dir / "best.pth")
+            print(f"  ✓ New best mIoU={best_miou:.4f}")
+
+    # Print classwise table for this model
+    print(f"\n── {model_name} best results ──")
+    print(f"{'Class':<30} {'IoU':>8}")
+    print("-" * 42)
+    for cls, iou in best_results["class_iou"].items():
+        print(f"{cls:<30} {iou:>8.4f}")
+    print("-" * 42)
+    print(f"{'mIoU':<30} {best_results['miou']:>8.4f}")
+    print(f"{'Pixel Acc':<30} {best_results['pixel_acc']:>8.4f}")
+
+    with open(out_dir / "results.json", "w") as f:
+        json.dump({"model": model_name, "best_miou": best_miou,
+                   "results": best_results, "history": history}, f, indent=2)
+
+    return best_miou, best_results
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    dataset = NuImagesTorchDataset(DATAROOT)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",      default="resnet101",
+                        choices=MODEL_NAMES + ["all"])
+    parser.add_argument("--data_root",  required=True)
+    parser.add_argument("--output_dir", default="./outputs")
+    parser.add_argument("--epochs",     type=int,   default=40)
+    parser.add_argument("--batch_size", type=int,   default=8)
+    parser.add_argument("--img_size",   type=int,   default=512)
+    parser.add_argument("--lr",         type=float, default=6e-5)
+    args = parser.parse_args()
 
-    model = SegformerClasswise(num_classes=7)
-    load_pretrained_hf(model, HF_ID)   # classifier stays random because we skipped it
-    model = model.to(DEVICE)
+    device = get_device()
+    models = MODEL_NAMES if args.model == "all" else [args.model]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    all_results = {}
+    for m in models:
+        miou, results = train_model(m, args, device)
+        all_results[m] = {"miou": miou, "class_iou": results["class_iou"]}
 
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0.0
+    # Final comparison table — classwise mIoU for all models
+    print(f"\n{'='*60}")
+    print("FINAL COMPARISON — Classwise mIoU")
+    print(f"{'='*60}")
+    col_w = 12
+    print(f"{'Class':<30}", end="")
+    for m in models:
+        print(f"  {m[:col_w]:<{col_w}}", end="")
+    print()
+    print("-" * (30 + (col_w + 2) * len(models)))
 
-        for batch in loader:
-            x = batch["pixel_values"].to(DEVICE)
-            y = batch["labels"].to(DEVICE)
+    for cls in CLASSES:
+        print(f"{cls:<30}", end="")
+        for m in models:
+            iou = all_results[m]["class_iou"].get(cls, 0.0)
+            print(f"  {iou:>{col_w}.4f}", end="")
+        print()
 
-            logits = model(x)   # [B, 7, h, w]
+    print("-" * (30 + (col_w + 2) * len(models)))
+    print(f"{'mIoU':<30}", end="")
+    for m in models:
+        print(f"  {all_results[m]['miou']:>{col_w}.4f}", end="")
+    print()
 
-            logits = F.interpolate(
-                logits,
-                size=y.shape[-2:],
-                mode="bilinear",
-                align_corners=False
-            )
+    # Save summary
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(exist_ok=True)
+    with open(out_dir / "summary.json", "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nSummary saved → {out_dir / 'summary.json'}")
 
-            loss = F.cross_entropy(logits, y, ignore_index=IGNORE_INDEX)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1}/{EPOCHS} - loss: {avg_loss:.4f}")
-
-        torch.save(model.state_dict(), "segformer_nuimages_7cls.pth")
 
 if __name__ == "__main__":
     main()
