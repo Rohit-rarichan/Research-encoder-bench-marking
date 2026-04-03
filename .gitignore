@@ -1,5 +1,6 @@
 datasets/
 .venv/
+outputs/
 __pycache__/
 v2x-subset/
 nuImages/
