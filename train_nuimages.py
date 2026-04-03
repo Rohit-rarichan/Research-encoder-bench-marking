@@ -17,6 +17,7 @@ import argparse
 import json
 from pathlib import Path
 
+from torch.cuda.amp import autocast, GradScaler
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,7 +61,10 @@ def build_model(name, num_classes):
         raise ValueError(f"Unknown model: {name}")
 
 
-MODEL_NAMES = ["segformer", "segformer_upernet", "resnet101", "swin_b", "convnext_b"]
+MODEL_NAMES = [
+    # "segformer",  # Commented out - using UPerNet variants only
+    "segformer_upernet", "resnet101", "swin_b", "convnext_b"
+]
 
 
 # ── Device ────────────────────────────────────────────────────────────────────
@@ -81,17 +85,20 @@ def get_device():
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
     criterion  = nn.CrossEntropyLoss(ignore_index=255)
+    scaler     = GradScaler()
     total_loss = 0.0
     for imgs, masks in tqdm(loader, desc="  train", leave=False):
         imgs, masks = imgs.to(device), masks.to(device)
-        optimizer.zero_grad()
-        logits = model(imgs)
-        loss   = criterion(logits, masks)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        with autocast():
+            logits = model(imgs)
+            logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            loss   = criterion(logits, masks)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item()
     return total_loss / len(loader)
-
 
 @torch.no_grad()
 def evaluate(model, loader, device):
@@ -102,14 +109,24 @@ def evaluate(model, loader, device):
     for imgs, masks in tqdm(loader, desc="  eval ", leave=False):
         imgs, masks = imgs.to(device), masks.to(device)
         logits      = model(imgs)
+        # Upsample to match mask resolution
+        logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
         total_loss += criterion(logits, masks).item()
-        metrics.update(logits.argmax(dim=1), masks)
-    return total_loss / len(loader), metrics.compute()
+        preds = logits.argmax(dim=1)
+        metrics.update(preds, masks)
+    
+    results = metrics.compute()
+    return total_loss / len(loader), results
 
 
 # ── Per-model training run ────────────────────────────────────────────────────
 
 def train_model(model_name, args, device):
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    import gc; gc.collect()
+
+
     print(f"\n{'='*60}")
     print(f"  Model  : {model_name}")
     print(f"  Epochs : {args.epochs}  |  BS : {args.batch_size}  |  LR : {args.lr}")
@@ -154,18 +171,24 @@ def train_model(model_name, args, device):
 
     # Print classwise table for this model
     print(f"\n── {model_name} best results ──")
-    print(f"{'Class':<30} {'IoU':>8}")
-    print("-" * 42)
-    for cls, iou in best_results["class_iou"].items():
-        print(f"{cls:<30} {iou:>8.4f}")
-    print("-" * 42)
-    print(f"{'mIoU':<30} {best_results['miou']:>8.4f}")
-    print(f"{'Pixel Acc':<30} {best_results['pixel_acc']:>8.4f}")
+    if best_results is not None:
+        print(f"{'Class':<30} {'IoU':>8}")
+        print("-" * 42)
+        for cls, iou in best_results["class_iou"].items():
+            print(f"{cls:<30} {iou:>8.4f}")
+        print("-" * 42)
+        print(f"{'mIoU':<30} {best_results['miou']:>8.4f}")
+        print(f"{'Pixel Acc':<30} {best_results['pixel_acc']:>8.4f}")
+    else:
+        print("⚠ No validation results recorded. Training may have failed.")
 
     with open(out_dir / "results.json", "w") as f:
         json.dump({"model": model_name, "best_miou": best_miou,
                    "results": best_results, "history": history}, f, indent=2)
-
+    del model
+    torch.cuda.empty_cache()
+    import gc; gc.collect()
+    
     return best_miou, best_results
 
 
@@ -189,38 +212,48 @@ def main():
     all_results = {}
     for m in models:
         miou, results = train_model(m, args, device)
-        all_results[m] = {"miou": miou, "class_iou": results["class_iou"]}
+        if results is not None:
+            all_results[m] = {"miou": miou, "class_iou": results["class_iou"]}
+        else:
+            print(f"⚠ Skipping {m} — validation failed")
 
     # Final comparison table — classwise mIoU for all models
-    print(f"\n{'='*60}")
-    print("FINAL COMPARISON — Classwise mIoU")
-    print(f"{'='*60}")
-    col_w = 12
-    print(f"{'Class':<30}", end="")
-    for m in models:
-        print(f"  {m[:col_w]:<{col_w}}", end="")
-    print()
-    print("-" * (30 + (col_w + 2) * len(models)))
-
-    for cls in CLASSES:
-        print(f"{cls:<30}", end="")
-        for m in models:
-            iou = all_results[m]["class_iou"].get(cls, 0.0)
-            print(f"  {iou:>{col_w}.4f}", end="")
+    if all_results:
+        print(f"\n{'='*60}")
+        print("FINAL COMPARISON — Classwise mIoU")
+        print(f"{'='*60}")
+        col_w = 12
+        successful_models = list(all_results.keys())
+        print(f"{'Class':<30}", end="")
+        for m in successful_models:
+            print(f"  {m[:col_w]:<{col_w}}", end="")
         print()
+        print("-" * (30 + (col_w + 2) * len(successful_models)))
 
-    print("-" * (30 + (col_w + 2) * len(models)))
-    print(f"{'mIoU':<30}", end="")
-    for m in models:
-        print(f"  {all_results[m]['miou']:>{col_w}.4f}", end="")
-    print()
+        for cls in CLASSES:
+            print(f"{cls:<30}", end="")
+            for m in successful_models:
+                iou = all_results[m]["class_iou"].get(cls, 0.0)
+                print(f"  {iou:>{col_w}.4f}", end="")
+            print()
+
+        print("-" * (30 + (col_w + 2) * len(successful_models)))
+        print(f"{'mIoU':<30}", end="")
+        for m in successful_models:
+            print(f"  {all_results[m]['miou']:>{col_w}.4f}", end="")
+        print()
+    else:
+        print("\n⚠ No models completed successfully.")
 
     # Save summary
     out_dir = Path(args.output_dir)
     out_dir.mkdir(exist_ok=True)
     with open(out_dir / "summary.json", "w") as f:
         json.dump(all_results, f, indent=2)
-    print(f"\nSummary saved → {out_dir / 'summary.json'}")
+    if all_results:
+        print(f"\nSummary saved → {out_dir / 'summary.json'}")
+    else:
+        print(f"\n⚠ Summary (empty) saved → {out_dir / 'summary.json'}")
 
 
 if __name__ == "__main__":

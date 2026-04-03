@@ -85,26 +85,28 @@ class PatchMerging(nn.Module):
         self.reduction = nn.Linear(4 * in_dim, 2 * in_dim, bias=False)
 
     def forward(self, x, H, W):
-        # x: [B, H*W, C]
         B, L, C = x.shape
         x = x.view(B, H, W, C)
 
-        # Pad if H or W is odd
         pad_bottom = H % 2
         pad_right  = W % 2
         if pad_bottom or pad_right:
             x = F.pad(x, (0, 0, 0, pad_right, 0, pad_bottom))
+            H_pad = H + pad_bottom  # ← track padded size
+            W_pad = W + pad_right
+        else:
+            H_pad, W_pad = H, W     # ← no change needed
 
-        x0 = x[:, 0::2, 0::2, :]   # top-left
-        x1 = x[:, 1::2, 0::2, :]   # bottom-left
-        x2 = x[:, 0::2, 1::2, :]   # top-right
-        x3 = x[:, 1::2, 1::2, :]   # bottom-right
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
 
-        x = torch.cat([x0, x1, x2, x3], dim=-1)  # [B, H/2, W/2, 4C]
+        x = torch.cat([x0, x1, x2, x3], dim=-1)
         x = x.view(B, -1, 4 * C)
         x = self.norm(x)
-        x = self.reduction(x)                     # [B, H/2*W/2, 2C]
-        return x, H // 2, W // 2
+        x = self.reduction(x)
+        return x, H_pad // 2, W_pad // 2  # ← return consistent dims
 
 
 # -------------------------
@@ -361,11 +363,15 @@ class SwinBEncoder(nn.Module):
         x, H, W = self.patch_embed(x)   # [B, H/4*W/4, 128]
 
         outs = []
-        for i in range(4):
-            # Run transformer blocks
-            for blk in self.stages[i]:
-                x = blk(x, H, W)
+        from torch.utils.checkpoint import checkpoint
 
+        for i in range(4):
+            for blk in self.stages[i]:
+                if self.training:
+                    x = checkpoint(blk, x, H, W, use_reentrant=False)
+                else:
+                    x = blk(x, H, W)
+                    
             # Normalize and reshape to feature map
             x    = self.stage_norms[i](x)
             B, _, C = x.shape

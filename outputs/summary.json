@@ -1,0 +1,14 @@
+{
+  "convnext_b": {
+    "miou": 0.5422405281750556,
+    "class_iou": {
+      "vehicle": 0.7221631666788706,
+      "pedestrian": 0.05893063862627822,
+      "driveable_surface": 0.845627779220018,
+      "other_flat": 0.0,
+      "terrain": 0.0,
+      "manmade": 0.0,
+      "vegetation": 0.0
+    }
+  }
+}

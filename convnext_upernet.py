@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.utils.checkpoint import checkpoint as ckpt
 
 # -------------------------
 # Helpers
@@ -153,17 +153,27 @@ class ConvNeXtBEncoder(nn.Module):
                 nn.init.constant_(m.bias,   0.0)
 
     def forward(self, x):
-        x  = self.stem(x)         # [B, 128, H/4,  W/4]
-        c1 = self.stages[0](x)    # [B, 128, H/4,  W/4]
+        x  = self.stem(x)
+        
+        # Stage 0
+        c1 = self.stages[0](x)
 
+        # Stage 1
         x  = self.downsamplers[0](c1)
-        c2 = self.stages[1](x)    # [B, 256, H/8,  W/8]
+        c2 = self.stages[1](x)
 
+        # Stage 2 — 27 blocks, use gradient checkpointing
         x  = self.downsamplers[1](c2)
-        c3 = self.stages[2](x)    # [B, 512, H/16, W/16]
+        if self.training:
+            for blk in self.stages[2]:
+                x = ckpt(blk, x, use_reentrant=False)
+            c3 = x
+        else:
+            c3 = self.stages[2](x)
 
+        # Stage 3
         x  = self.downsamplers[2](c3)
-        c4 = self.stages[3](x)    # [B, 1024, H/32, W/32]
+        c4 = self.stages[3](x)
 
         return [c1, c2, c3, c4]
 

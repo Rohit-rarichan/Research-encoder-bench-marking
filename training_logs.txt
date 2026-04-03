@@ -1,0 +1,100 @@
+
+Epoch 20/40
+  train_loss=0.8370  val_loss=0.7621  mIoU=0.3642
+
+Epoch 21/40
+  train_loss=0.7771  val_loss=0.6303  mIoU=0.4506
+  ✓ New best mIoU=0.4506
+
+Epoch 22/40
+  train_loss=0.2938  val_loss=0.7196  mIoU=0.3871
+
+Epoch 23/40
+  train_loss=0.2434  val_loss=0.7389  mIoU=0.3751
+
+Epoch 24/40
+  train_loss=0.2308  val_loss=0.5936  mIoU=0.3881
+
+Epoch 25/40
+  train_loss=0.2089  val_loss=0.7206  mIoU=0.4067
+
+Epoch 26/40
+  train_loss=0.2208  val_loss=0.7111  mIoU=0.4145
+
+Epoch 27/40
+  train_loss=0.1621  val_loss=0.8019  mIoU=0.3278
+
+Epoch 28/40
+  train_loss=0.1975  val_loss=1.1514  mIoU=0.2508
+
+Epoch 29/40
+  train_loss=0.3440  val_loss=1.1024  mIoU=0.2621
+
+Epoch 30/40
+  train_loss=0.2215  val_loss=0.9569  mIoU=0.2951
+
+Epoch 31/40
+  train_loss=0.1874  val_loss=0.7215  mIoU=0.4468
+
+Epoch 32/40
+  train_loss=0.1642  val_loss=0.5435  mIoU=0.5035
+  ✓ New best mIoU=0.5035
+
+Epoch 33/40
+  train_loss=0.6396  val_loss=0.7165  mIoU=0.3831
+
+Epoch 34/40
+  train_loss=0.1676  val_loss=0.5570  mIoU=0.4871
+
+Epoch 35/40
+  train_loss=0.2705  val_loss=0.6585  mIoU=0.4270
+
+Epoch 36/40
+  train_loss=0.2278  val_loss=0.5335  mIoU=0.5004
+
+Epoch 37/40
+  train_loss=0.1708  val_loss=0.5598  mIoU=0.4802
+
+Epoch 38/40
+  train_loss=0.1729  val_loss=0.4631  mIoU=0.5422
+  ✓ New best mIoU=0.5422
+
+Epoch 39/40
+  train_loss=0.1945  val_loss=0.5725  mIoU=0.4764
+
+Epoch 40/40
+  train_loss=0.2120  val_loss=0.7061  mIoU=0.4027
+
+── convnext_b best results ──
+Class                               IoU
+------------------------------------------
+vehicle                          0.7222
+pedestrian                       0.0589
+driveable_surface                0.8456
+other_flat                       0.0000
+terrain                          0.0000
+manmade                          0.0000
+vegetation                       0.0000
+------------------------------------------
+mIoU                             0.5422
+Pixel Acc                        0.8812
+
+============================================================
+FINAL COMPARISON — Classwise mIoU
+============================================================
+Class                           convnext_b
+--------------------------------------------
+vehicle                               0.7222
+pedestrian                            0.0589
+driveable_surface                     0.8456
+other_flat                            0.0000
+terrain                               0.0000
+manmade                               0.0000
+vegetation                            0.0000
+--------------------------------------------
+mIoU                                  0.5422
+
+Summary saved → outputs/summary.json
+(bench-marking) tamoghno@tamoghno-bias:~/image_encoders/bench-marking$ tmux capture-pane -p -t en
+coders -S -10000 | tail -100 > training_logs.txt
+
