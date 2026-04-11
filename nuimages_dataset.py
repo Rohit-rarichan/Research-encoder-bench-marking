@@ -33,8 +33,13 @@ def mask_decode(rle_mask):
 
 IGNORE_INDEX = 255
 
+# Specific vehicle classes for accurate classification
 CLASS_NAMES = [
-    "vehicle",
+    "car",
+    "truck",
+    "bus",
+    "bicycle",
+    "motorcycle",
     "pedestrian",
     "driveable_surface",
     "other_flat",
@@ -45,10 +50,34 @@ CLASS_NAMES = [
 CLASS_NAME_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
 
 def map_category_name(category_name: str):
+    """Map nuimages category names to class IDs.
+    
+    Ensures accurate classification:
+    - vehicle.car -> car class
+    - vehicle.truck -> truck class  
+    - vehicle.bus.* -> bus class
+    - vehicle.bicycle -> bicycle class
+    - vehicle.motorcycle -> motorcycle class
+    - pedestrian* -> pedestrian class
+    """
     name = category_name.lower()
 
-    if any(x in name for x in ["vehicle", "car", "truck", "bus", "trailer", "construction", "bicycle", "motorcycle"]):
-        return CLASS_NAME_TO_ID["vehicle"]
+    # Accurate vehicle classification
+    if "vehicle.car" in name:
+        return CLASS_NAME_TO_ID["car"]
+    
+    if "vehicle.truck" in name:
+        return CLASS_NAME_TO_ID["truck"]
+    
+    if "vehicle.bus" in name:
+        return CLASS_NAME_TO_ID["bus"]
+    
+    if "vehicle.bicycle" in name:
+        return CLASS_NAME_TO_ID["bicycle"]
+    
+    if "vehicle.motorcycle" in name:
+        return CLASS_NAME_TO_ID["motorcycle"]
+    
     if "pedestrian" in name:
         return CLASS_NAME_TO_ID["pedestrian"]
     if "driveable_surface" in name or "driveable surface" in name:
@@ -178,16 +207,30 @@ CLASSES = CLASS_NAMES
 class NuImagesDataset(NuImagesMiniDataset):
     """Extended dataset class with split support and img_size parameter."""
     
-    def __init__(self, dataroot, split="train", img_size=512, version="v1.0-mini"):
+    def __init__(
+        self,
+        dataroot,
+        split="train",
+        img_size=512,
+        version="v1.0-mini",
+        use_internal_split=True,
+        train_split_ratio=0.8,
+    ):
         super().__init__(dataroot, version=version)
         self.split = split
         self.img_size = img_size
+        self.use_internal_split = use_internal_split
         
-        # Train/val split (80/20)
-        split_idx = int(0.8 * len(self.items))
-        if split == "train":
-            self.items = self.items[:split_idx]
-        elif split == "val":
-            self.items = self.items[split_idx:]
+        if self.use_internal_split:
+            # Legacy behavior: split one metadata directory into train/val subsets.
+            split_idx = int(train_split_ratio * len(self.items))
+            if split == "train":
+                self.items = self.items[:split_idx]
+            elif split in ("val", "test"):
+                self.items = self.items[split_idx:]
+            else:
+                raise ValueError(f"Unknown split: {split}")
         else:
-            raise ValueError(f"Unknown split: {split}")
+            # Explicit split behavior: use all keyframes from the provided version.
+            if split not in ("train", "val", "test"):
+                raise ValueError(f"Unknown split: {split}")

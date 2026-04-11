@@ -1,6 +1,7 @@
 datasets/
 .venv/
 outputs/
+nuimages_subset_pss_500_100/
 __pycache__/
 v2x-subset/
 nuImages/
@@ -8,7 +9,7 @@ nuscenes/
 *.zip
 *.tar.gz
 *.tgz
-*.png
+*.pngd
 *.jpg
 *LICENSE
 *.pth

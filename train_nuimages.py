@@ -130,11 +130,43 @@ def train_model(model_name, args, device):
     print(f"\n{'='*60}")
     print(f"  Model  : {model_name}")
     print(f"  Epochs : {args.epochs}  |  BS : {args.batch_size}  |  LR : {args.lr}")
+    print(f"  Train Version : {args.train_version}  |  Val Version : {args.val_version}")
+    print(f"  Explicit Splits: {args.explicit_splits}")
     print(f"{'='*60}")
 
     pin          = device.type == "cuda"
-    train_ds     = NuImagesDataset(args.data_root, split="train", img_size=args.img_size)
-    val_ds       = NuImagesDataset(args.data_root, split="val",   img_size=args.img_size)
+    if args.explicit_splits:
+        train_ds = NuImagesDataset(
+            args.data_root,
+            split="train",
+            img_size=args.img_size,
+            version=args.train_version,
+            use_internal_split=False,
+        )
+        val_ds = NuImagesDataset(
+            args.data_root,
+            split="val",
+            img_size=args.img_size,
+            version=args.val_version,
+            use_internal_split=False,
+        )
+    else:
+        train_ds = NuImagesDataset(
+            args.data_root,
+            split="train",
+            img_size=args.img_size,
+            version=args.train_version,
+            use_internal_split=True,
+        )
+        val_ds = NuImagesDataset(
+            args.data_root,
+            split="val",
+            img_size=args.img_size,
+            version=args.train_version,
+            use_internal_split=True,
+        )
+
+    print(f"  Train samples: {len(train_ds)}  |  Val samples: {len(val_ds)}")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True,  num_workers=4, pin_memory=pin)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
@@ -199,12 +231,21 @@ def main():
     parser.add_argument("--model",      default="resnet101",
                         choices=MODEL_NAMES + ["all"])
     parser.add_argument("--data_root",  required=True)
+    parser.add_argument("--train_version", default="v1.0-mini",
+                        help="Metadata split directory to use for training (e.g. v1.0-mini, v1.0-train)")
+    parser.add_argument("--val_version", default=None,
+                        help="Metadata split directory to use for validation when --explicit_splits is set")
+    parser.add_argument("--explicit_splits", action="store_true",
+                        help="Use explicit split directories for train/val instead of internal 80/20 split")
     parser.add_argument("--output_dir", default="./outputs")
     parser.add_argument("--epochs",     type=int,   default=40)
     parser.add_argument("--batch_size", type=int,   default=8)
     parser.add_argument("--img_size",   type=int,   default=512)
     parser.add_argument("--lr",         type=float, default=6e-5)
     args = parser.parse_args()
+
+    if args.val_version is None:
+        args.val_version = args.train_version
 
     device = get_device()
     models = MODEL_NAMES if args.model == "all" else [args.model]
