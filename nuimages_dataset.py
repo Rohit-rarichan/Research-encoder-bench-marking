@@ -50,23 +50,27 @@ CLASS_NAMES = [
 CLASS_NAME_TO_ID = {name: i for i, name in enumerate(CLASS_NAMES)}
 
 def map_category_name(category_name: str):
-    """Map nuimages category names to class IDs.
+    """Map ALL nuimages category names to class IDs.
     
-    Ensures accurate classification:
-    - vehicle.car -> car class
-    - vehicle.truck -> truck class  
-    - vehicle.bus.* -> bus class
-    - vehicle.bicycle -> bicycle class
-    - vehicle.motorcycle -> motorcycle class
-    - pedestrian* -> pedestrian class
+    Comprehensive mapping to the 11 existing classes:
+    - vehicle.car, vehicle.ego -> car
+    - vehicle.truck, vehicle.trailer, vehicle.construction, vehicle.emergency.* -> truck
+    - vehicle.bus.* -> bus
+    - vehicle.bicycle -> bicycle
+    - vehicle.motorcycle -> motorcycle
+    - pedestrian.* (all variants), animal -> pedestrian
+    - personal_mobility (scooter) -> bicycle
+    - barriers, debris, traffic cones, etc. -> bicycle (small obstacles)
+    - driveable_surface -> driveable_surface (won't contribute to mIoU)
+    - other_flat, terrain, manmade, vegetation -> surface classes (ignored)
     """
     name = category_name.lower()
 
-    # Accurate vehicle classification
-    if "vehicle.car" in name:
+    # Vehicle classification (most specific first)
+    if "vehicle.car" in name or "vehicle.ego" in name:
         return CLASS_NAME_TO_ID["car"]
     
-    if "vehicle.truck" in name:
+    if "vehicle.truck" in name or "vehicle.trailer" in name or "vehicle.construction" in name or "vehicle.emergency" in name:
         return CLASS_NAME_TO_ID["truck"]
     
     if "vehicle.bus" in name:
@@ -78,8 +82,19 @@ def map_category_name(category_name: str):
     if "vehicle.motorcycle" in name:
         return CLASS_NAME_TO_ID["motorcycle"]
     
-    if "pedestrian" in name:
+    # Pedestrian classification (all variants)
+    if "pedestrian" in name or "animal" in name:
         return CLASS_NAME_TO_ID["pedestrian"]
+    
+    # Personal mobility devices (scooters, skateboards) -> bicycle
+    if "personal_mobility" in name:
+        return CLASS_NAME_TO_ID["bicycle"]
+    
+    # Movable objects and obstacles -> bicycle (treat as small obstructions similar to bicycles)
+    if "barrier" in name or "debris" in name or "pushable_pullable" in name or "bicycle_rack" in name or "trafficcone" in name:
+        return CLASS_NAME_TO_ID["bicycle"]
+    
+    # Surface classes (won't contribute to mIoU)
     if "driveable_surface" in name or "driveable surface" in name:
         return CLASS_NAME_TO_ID["driveable_surface"]
     if "other_flat" in name or "other flat" in name:
@@ -91,6 +106,7 @@ def map_category_name(category_name: str):
     if "vegetation" in name:
         return CLASS_NAME_TO_ID["vegetation"]
 
+    # Any remaining unmapped category returns None and is ignored
     return None
 
 

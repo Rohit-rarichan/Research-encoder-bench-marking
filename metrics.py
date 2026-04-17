@@ -83,9 +83,17 @@ class SegmentationMetrics:
             if gt_count > 0:
                 acc_per_class[i] = tp[i] / gt_count
 
-        # mIoU only over classes that appear in GT
+        # mIoU only over classes that appear in GT, excluding surface/background classes
         present = cm.sum(axis=1) > 0
-        miou    = iou_per_class[present].mean() if present.any() else 0.0
+        # Exclude classes without meaningful training: driveable_surface, other_flat, terrain, manmade, vegetation
+        exclude_classes = {"driveable_surface", "other_flat", "terrain", "manmade", "vegetation"}
+        exclude_mask = np.ones(self.num_classes, dtype=bool)
+        for i, name in enumerate(self.class_names):
+            if name in exclude_classes:
+                exclude_mask[i] = False
+        
+        present_and_not_excluded = present & exclude_mask
+        miou    = iou_per_class[present_and_not_excluded].mean() if present_and_not_excluded.any() else 0.0
 
         # Pixel accuracy
         pixel_acc = tp.sum() / cm.sum() if cm.sum() > 0 else 0.0

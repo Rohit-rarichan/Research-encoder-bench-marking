@@ -2,6 +2,8 @@ datasets/
 .venv/
 outputs/
 nuimages_subset_pss_500_100/
+v1.0-train-5pct/
+outputs/
 __pycache__/
 v2x-subset/
 nuImages/
