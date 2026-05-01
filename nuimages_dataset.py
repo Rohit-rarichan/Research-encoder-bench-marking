@@ -60,7 +60,7 @@ def map_category_name(category_name: str):
     - vehicle.motorcycle -> motorcycle
     - pedestrian.* (all variants), animal -> pedestrian
     - personal_mobility (scooter) -> bicycle
-    - barriers, debris, traffic cones, etc. -> bicycle (small obstacles)
+    - barriers, debris, traffic cones, pushable_pullable -> other_flat (ignored classes)
     - driveable_surface -> driveable_surface (won't contribute to mIoU)
     - other_flat, terrain, manmade, vegetation -> surface classes (ignored)
     """
@@ -90,9 +90,10 @@ def map_category_name(category_name: str):
     if "personal_mobility" in name:
         return CLASS_NAME_TO_ID["bicycle"]
     
-    # Movable objects and obstacles -> bicycle (treat as small obstructions similar to bicycles)
+    # Movable objects and obstacles -> other_flat (ignored in mIoU)
+    # This avoids polluting relevant class predictions (bicycle, pedestrian, etc.)
     if "barrier" in name or "debris" in name or "pushable_pullable" in name or "bicycle_rack" in name or "trafficcone" in name:
-        return CLASS_NAME_TO_ID["bicycle"]
+        return CLASS_NAME_TO_ID["other_flat"]
     
     # Surface classes (won't contribute to mIoU)
     if "driveable_surface" in name or "driveable surface" in name:
@@ -203,9 +204,12 @@ class NuImagesMiniDataset:
         # Convert BGR to RGB
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # Normalize image to [0, 1]
+        # Normalize with ImageNet mean/std (required for pretrained backbones)
         img = img.astype(np.float32) / 255.0
-        
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img  = (img - mean) / std
+
         # Convert to tensor (H, W, C) -> (C, H, W)
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
         
