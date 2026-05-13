@@ -32,15 +32,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 
-from nuimages_dataset import NuImagesDataset, NUM_CLASSES, CLASSES
-from metrics import SegmentationMetrics
+from data.nuimages_dataset import NuImagesDataset, NUM_CLASSES, CLASSES
+from utils.metrics import SegmentationMetrics
 
 # Import all model classes
-from segformer import SegformerClasswise
-from segformer_upernet import SegformerUPerNet
-from resnet101_upernet import ResNet101UPerNet
-from swin_upernet import SwinBUPerNet
-from convnext_upernet import ConvNeXtBUPerNet
+from models.segformer import SegformerClasswise
+from models.segformer_upernet import SegformerUPerNet
+from models.resnet101_upernet import ResNet101UPerNet
+from models.swin_upernet import SwinBUPerNet
+from models.convnext_upernet import ConvNeXtBUPerNet
 
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
@@ -62,38 +62,41 @@ def set_seed(seed=SEED):
 
 # ── Class Weighting ───────────────────────────────────────────────────────────
 
-def compute_class_weights(dataset, num_classes, ignore_index=255):
-    """Compute class weights based on inverse frequency from training dataset."""
-    print("\n  Computing class weights from training data...")
+def compute_class_weights(dataset, num_classes, ignore_index=255, cache_path=None):
+    """Compute class weights based on inverse frequency. Caches result to disk."""
+    if cache_path is not None and Path(cache_path).exists():
+        weights = torch.load(cache_path, weights_only=True)
+        print(f"\n  Class weights loaded from cache: {cache_path}")
+        return weights
+
+    print("\n  Computing class weights from training data (one-time scan)...")
     class_counts = np.zeros(num_classes)
-    
+
     for _, mask in tqdm(dataset, desc="    scanning dataset", leave=False):
-        # Count pixels per class
         for c in range(num_classes):
             class_counts[c] += (mask == c).sum().item()
-    
-    # Compute weights: inverse frequency
+
     total_pixels = class_counts.sum()
     weights = np.zeros(num_classes)
     for c in range(num_classes):
         if class_counts[c] > 0:
-            # weight = total / (num_classes * count_per_class)
             weights[c] = total_pixels / (num_classes * class_counts[c])
         else:
-            weights[c] = 1.0  # Default weight for unseen classes
-    
-    # Normalize weights
+            weights[c] = 1.0
+
     weights = weights / weights.sum() * num_classes
-    
-    # Note: ignore_index is handled by CrossEntropyLoss, not by weights array
-    # weights array only has entries for the num_classes
-    
+
     print(f"  Class weights computed:")
     for i, w in enumerate(weights):
         if i < len(CLASSES):
             print(f"    {CLASSES[i]:<20}: {w:>6.3f} (pixels: {class_counts[i]/1e6:>6.1f}M)")
-    
-    return torch.tensor(weights, dtype=torch.float32)
+
+    result = torch.tensor(weights, dtype=torch.float32)
+    if cache_path is not None:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(result, cache_path)
+        print(f"  Class weights cached → {cache_path}")
+    return result
 
 
 # ── Training History Logger ───────────────────────────────────────────────────
@@ -153,23 +156,23 @@ class TrainingLogger:
 # ── Early Stopping ────────────────────────────────────────────────────────────
 
 class EarlyStopping:
-    """Stop training if validation loss doesn't improve."""
-    
+    """Stop training if val mIoU doesn't improve."""
+
     def __init__(self, patience=5, verbose=True):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
-        self.best_loss = None
+        self.best_miou = None
         self.should_stop = False
-    
-    def __call__(self, val_loss, epoch):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss < self.best_loss:
-            self.best_loss = val_loss
+
+    def __call__(self, val_miou, epoch):
+        if self.best_miou is None:
+            self.best_miou = val_miou
+        elif val_miou > self.best_miou:
+            self.best_miou = val_miou
             self.counter = 0
             if self.verbose:
-                print(f"    ✓ Validation loss improved to {val_loss:.4f}")
+                print(f"    ✓ Val mIoU improved to {val_miou:.4f}")
         else:
             self.counter += 1
             if self.verbose:
@@ -334,9 +337,134 @@ def load_pretrained_weights(model, model_name):
                 print(f"  ⚠ Could not load pretrained Swin-B weights: {e}")
             return model
 
+        elif model_name == "segformer_upernet":
+            import re, os, glob
+            print("  Loading pretrained MiT-B0 backbone from HuggingFace cache...")
+            try:
+                snapshot_dir = os.path.expanduser(
+                    "~/.cache/huggingface/hub/models--nvidia--mit-b0/snapshots"
+                )
+                bins = glob.glob(snapshot_dir + "/*/pytorch_model.bin")
+                if not bins:
+                    print("  ⚠ HF cache not found — skipping pretrained load for SegFormer")
+                    return model
+                hf_sd = torch.load(bins[0], map_location="cpu", weights_only=True)
+                # strip segformer.encoder. prefix; drop keys that don't belong to encoder
+                hf_enc = {
+                    k.replace("segformer.encoder.", ""): v
+                    for k, v in hf_sd.items()
+                    if k.startswith("segformer.encoder.")
+                }
+                encoder = model.encoder
+                our_sd  = encoder.state_dict()
+                mapped  = {}
+                matched = 0
+
+                # collect key/value tensors for KV fusion
+                key_w, key_b, val_w, val_b = {}, {}, {}, {}
+
+                for hk, hv in hf_enc.items():
+                    m = re.match(r"patch_embeddings\.(\d+)\.(proj\..+)", hk)
+                    if m:
+                        ok = f"patch_embeds.{m.group(1)}.{m.group(2)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"patch_embeddings\.(\d+)\.layer_norm\.(.+)", hk)
+                    if m:
+                        ok = f"patch_embeds.{m.group(1)}.norm.{m.group(2)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.layer_norm_1\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.norm1.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.layer_norm_2\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.norm2.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.query\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.attn.q.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.key\.weight", hk)
+                    if m: key_w[(m.group(1), m.group(2))] = hv; continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.key\.bias", hk)
+                    if m: key_b[(m.group(1), m.group(2))] = hv; continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.value\.weight", hk)
+                    if m: val_w[(m.group(1), m.group(2))] = hv; continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.value\.bias", hk)
+                    if m: val_b[(m.group(1), m.group(2))] = hv; continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.layer_norm\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.attn.norm.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.self\.sr\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.attn.sr.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.attention\.output\.dense\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.attn.proj.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.mlp\.dense1\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.mlp.fc1.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.mlp\.dense2\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.mlp.fc2.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"block\.(\d+)\.(\d+)\.mlp\.dwconv\.dwconv\.(.+)", hk)
+                    if m:
+                        ok = f"stages.{m.group(1)}.{m.group(2)}.mlp.dwconv.{m.group(3)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+                    m = re.match(r"layer_norm\.(\d+)\.(.+)", hk)
+                    if m:
+                        ok = f"stage_norms.{m.group(1)}.{m.group(2)}"
+                        if ok in our_sd and our_sd[ok].shape == hv.shape:
+                            mapped[ok] = hv; matched += 1
+                        continue
+
+                # KV fusion: cat(key, value) along dim-0
+                for (i, j) in key_w:
+                    ok_w = f"stages.{i}.{j}.attn.kv.weight"
+                    ok_b = f"stages.{i}.{j}.attn.kv.bias"
+                    fused_w = torch.cat([key_w[(i, j)], val_w[(i, j)]], dim=0)
+                    fused_b = torch.cat([key_b[(i, j)], val_b[(i, j)]], dim=0)
+                    if ok_w in our_sd and our_sd[ok_w].shape == fused_w.shape:
+                        mapped[ok_w] = fused_w; matched += 1
+                    if ok_b in our_sd and our_sd[ok_b].shape == fused_b.shape:
+                        mapped[ok_b] = fused_b; matched += 1
+
+                encoder.load_state_dict(mapped, strict=False)
+                print(f"  ✓ Loaded {matched}/{len(our_sd)} matched weights into SegFormer encoder")
+                del hf_sd
+            except Exception as e:
+                print(f"  ⚠ Could not load pretrained MiT-B0 weights: {e}")
+            return model
+
         else:
-            # For other models (ConvNeXt-B, SegFormer), skip pretrained loading
-            print(f"  Using random initialization for {model_name} (architecture-specific encoders)")
+            print(f"  Using random initialization for {model_name}")
             return model
     
     except Exception as e:
@@ -391,9 +519,8 @@ def get_device():
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, device, criterion, warmup_scheduler=None):
+def train_one_epoch(model, loader, optimizer, device, criterion, scaler, warmup_scheduler=None):
     model.train()
-    scaler     = GradScaler()
     total_loss = 0.0
     batch_count = 0
     bad_batches = []  # Track batches with unusually high loss
@@ -526,8 +653,9 @@ def train_model(model_name, args, device):
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
-    # Compute class weights from training data (for weighted loss)
-    class_weights = compute_class_weights(train_ds, NUM_CLASSES)
+    # Compute class weights from training data (cached after first run)
+    _weight_cache = Path(args.output_dir) / f"class_weights_{args.train_version.replace('/', '_')}.pt"
+    class_weights = compute_class_weights(train_ds, NUM_CLASSES, cache_path=_weight_cache)
     class_weights = class_weights.to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=255)
     
@@ -576,37 +704,15 @@ def train_model(model_name, args, device):
 
     if not _loaded:
         print(f"  ⟳ No existing checkpoint found — starting from scratch")
-    
-    elif resume_checkpoint and Path(resume_checkpoint).exists():
-        # Manual resume flag checkpoint
-        print(f"\n  ⟳ Loading checkpoint from --resume flag: {resume_checkpoint}")
-        checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
-        
-        if isinstance(checkpoint, dict) and "model_state" in checkpoint:
-            model.load_state_dict(checkpoint["model_state"])
-            print(f"    ✓ Model weights loaded")
-            if "best_miou" in checkpoint:
-                best_miou = checkpoint["best_miou"]
-                print(f"    ✓ Best mIoU: {best_miou:.4f}")
-        else:
-            model.load_state_dict(checkpoint)
-            print(f"    ✓ Model weights loaded")
-    elif hasattr(args, 'load_pretrained') and args.load_pretrained:
-        # Load pretrained ImageNet weights if available
-        print(f"\n  ⟳ Attempting to load pretrained ImageNet weights...")
-        try:
-            # This would need timm or torchvision integration
-            print(f"    (Pretrained loading requires additional setup)")
-        except Exception as e:
-            print(f"    ⚠ Could not load pretrained weights: {e}")
 
     # ────────────────────────────────────────────────────────────────────────────
 
+    scaler = GradScaler()  # created once so dynamic scale state persists across epochs
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}  (LR: {optimizer.param_groups[0]['lr']:.2e})")
-        
+
         # Training phase
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, criterion)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, criterion, scaler)
         
         # Learning rate step (once per epoch, not per batch)
         lr_scheduler.step()
@@ -668,7 +774,7 @@ def train_model(model_name, args, device):
             logger.plot_curves()
         
         # Early stopping check
-        early_stopping(val_loss, epoch)
+        early_stopping(val_miou, epoch)
         if early_stopping.should_stop:
             print(f"\n  ⟳ Training stopped early at epoch {epoch+1}/{args.epochs}")
             break
@@ -729,27 +835,49 @@ def train_model(model_name, args, device):
         print(f"{'mIoU':<30} {test_results['miou']:>8.4f}")
         print(f"{'Pixel Acc':<30} {test_results['pixel_acc']:>8.4f}")
     
-    # Evaluate on full remaining dataset (95%) if available
+    # Evaluate on full annotated dataset excluding training samples
+    # = all of v1.0-train (67,279) + all of v1.0-val (16,445) minus the ~2,344 training images
     full_dataset_results = None
     try:
-        print(f"\n── {model_name} full dataset evaluation (remaining 95%) ──")
-        full_ds = NuImagesDataset(
-            args.data_root,
-            split="val",  # This loads the full v1.0-val set
-            img_size=args.img_size,
-            version="v1.0-val",  # Full validation set
-            use_internal_split=False,
-        )
+        print(f"\n── {model_name} full annotated dataset evaluation (excluding train split) ──")
+
+        # Get tokens of samples used in training so we can exclude them
+        train_ds_full = NuImagesMiniDataset(args.data_root, version=args.train_version)
+        train_tokens = {sd["token"] for sd in train_ds_full.items}
+
+        # Build both splits and filter out training tokens
+        ds_train_full = NuImagesMiniDataset(args.data_root, version="v1.0-train")
+        ds_val_full   = NuImagesMiniDataset(args.data_root, version="v1.0-val")
+
+        # Filter v1.0-train items to exclude the training samples
+        ds_train_full.items = [sd for sd in ds_train_full.items if sd["token"] not in train_tokens]
+
+        # Combine into one dataset via a simple wrapper
+        class CombinedDataset(torch.utils.data.Dataset):
+            def __init__(self, ds_a, ds_b):
+                self.datasets = [ds_a, ds_b]
+                self.lengths  = [len(ds_a), len(ds_b)]
+            def __len__(self):
+                return sum(self.lengths)
+            def __getitem__(self, idx):
+                for ds, length in zip(self.datasets, self.lengths):
+                    if idx < length:
+                        return ds[idx]
+                    idx -= length
+                raise IndexError(idx)
+
+        full_ds = CombinedDataset(ds_train_full, ds_val_full)
         full_loader = DataLoader(full_ds, batch_size=args.batch_size,
-                                shuffle=False, num_workers=4, pin_memory=(device.type == "cuda"))
-        
-        print(f"  Full dataset samples: {len(full_ds)}")
+                                 shuffle=False, num_workers=4, pin_memory=(device.type == "cuda"))
+
+        print(f"  Samples: v1.0-train (excl. train split) = {len(ds_train_full)}, "
+              f"v1.0-val = {len(ds_val_full)}, total = {len(full_ds)}")
         model.load_state_dict(torch.load(out_dir / "best.pth", map_location=device))
         full_loss, full_dataset_results = evaluate(model, full_loader, device, criterion)
         print(f"Full Loss: {full_loss:.4f}  |  Full mIoU: {full_dataset_results['miou']:.4f}")
         print(f"{'Class':<30} {'IoU':>8}")
         print("-" * 42)
-        for cls, iou in list(full_dataset_results["class_iou"].items())[:10]:  # Show first 10
+        for cls, iou in full_dataset_results["class_iou"].items():
             print(f"{cls:<30} {iou:>8.4f}")
         print("-" * 42)
         print(f"{'mIoU':<30} {full_dataset_results['miou']:>8.4f}")
@@ -814,8 +942,8 @@ def main():
                         help="Metadata split directory for training")
     parser.add_argument("--val_version", default="v1.0-train-5pct-val",
                         help="Metadata split directory for validation")
-    parser.add_argument("--test_version", default="v1.0-train-5pct-test",
-                        help="Metadata split directory for testing")
+    parser.add_argument("--test_version", default="v1.0-val",
+                        help="Full val set — used for post-training inference mIoU")
     parser.add_argument("--explicit_splits", action="store_true", default=True,
                         help="Use explicit split directories for train/val/test")
     parser.add_argument("--output_dir", default="./outputs")

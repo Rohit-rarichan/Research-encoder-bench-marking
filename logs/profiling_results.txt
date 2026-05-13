@@ -1,0 +1,124 @@
+Device: cuda
+Using synthetic random inputs (512×512, batch=1).
+
+Profiling segformer    (9.4 M params) …
+  reshape     0.56 ±  0.02 ms (median 0.55 ms)
+  encoder     4.74 ±  0.19 ms (median 4.70 ms)
+  upernet     2.93 ±  0.06 ms (median 2.90 ms)
+  total       8.23 ms  (n=100 batches)
+
+Profiling resnet101    (127.9 M params) …
+  reshape     0.04 ±  0.00 ms (median 0.04 ms)
+  encoder     8.05 ±  0.11 ms (median 8.03 ms)
+  upernet     3.67 ±  0.01 ms (median 3.67 ms)
+  total      11.76 ms  (n=100 batches)
+
+Profiling swin_b       (111.9 M params) …
+  reshape     0.45 ±  0.02 ms (median 0.45 ms)
+  encoder    15.07 ±  0.23 ms (median 14.99 ms)
+  upernet     3.24 ±  0.01 ms (median 3.24 ms)
+  total      18.76 ms  (n=100 batches)
+
+Profiling convnext_b   (112.7 M params) …
+  reshape     0.04 ±  0.00 ms (median 0.04 ms)
+  encoder     9.13 ±  0.14 ms (median 9.08 ms)
+  upernet     3.12 ±  0.01 ms (median 3.12 ms)
+  total      12.30 ms  (n=100 batches)
+
+
+                          Latency per image (ms)                          
+─────────────────────────────────────────────────────────────────────────────
+Stage               segformer     resnet101       swin_b      convnext_b  
+─────────────────────────────────────────────────────────────────────────────
+  reshape            0.56±0.02     0.04±0.00     0.45±0.02     0.04±0.00  
+  encoder            4.74±0.19     8.05±0.11    15.07±0.23     9.13±0.14  
+  upernet            2.93±0.06     3.67±0.01     3.24±0.01     3.12±0.01  
+─────────────────────────────────────────────────────────────────────────────
+  total (mean)            8.23         11.76         18.76         12.30  
+─────────────────────────────────────────────────────────────────────────────
+
+                        Fraction of total latency                         
+─────────────────────────────────────────────────────────────────────────────
+Stage               segformer     resnet101       swin_b      convnext_b  
+─────────────────────────────────────────────────────────────────────────────
+  reshape               6.7 %         0.4 %         2.4 %         0.3 %   
+  encoder              57.6 %        68.4 %        80.3 %        74.2 %   
+  upernet              35.7 %        31.2 %        17.3 %        25.4 %
+─────────────────────────────────────────────────────────────────────────────
+
+
+================================================================================
+PARAMETER COUNT CLARIFICATION
+================================================================================
+
+The parameter counts reported above (e.g. ResNet-101: 127.9 M) are for the
+full model: backbone encoder + UPerNet decoder head combined.
+
+Backbone-only parameter counts (standard published values):
+
+  SegFormer MiT-B0  :   3.7 M   (backbone only)
+  ResNet-101        :  44.5 M   (backbone only)
+  Swin-B            :  87.8 M   (backbone only)
+  ConvNeXt-B        :  88.6 M   (backbone only)
+
+Why the UPerNet head adds so many params for ResNet-101:
+  ResNet-101's last stage outputs 2048 channels. The UPerNet PPM bottleneck
+  is a single Conv2d(4096, 2048, 3x3) layer — that one conv alone is ~75 M
+  params, pushing the total to 127.9 M. Swin-B and ConvNeXt-B top out at
+  1024 channels so their UPerNet head is much lighter (~24 M added).
+
+Full model breakdown (backbone + UPerNet):
+
+  SegFormer MiT-B0 + UPerNet  :   9.4 M   (3.7 M backbone + ~5.7 M head)
+  ResNet-101       + UPerNet  : 127.9 M   (44.5 M backbone + ~83.4 M head)
+  Swin-B           + UPerNet  : 111.9 M   (87.8 M backbone + ~24.1 M head)
+  ConvNeXt-B       + UPerNet  : 112.7 M   (88.6 M backbone + ~24.1 M head)
+
+
+================================================================================
+RESHAPE LATENCY EXPLANATION
+================================================================================
+
+ConvNeXt-B and ResNet-101 are pure CNNs — they always work in [B, C, H, W]
+format, so "reshape" is just the final output F.interpolate upsample (~0.04 ms).
+
+SegFormer and Swin-B are vision transformers that repeatedly convert between
+spatial feature maps and 1D token sequences:
+
+  SegFormer : 4x OverlapPatchEmbed (overlapping conv -> flatten -> transpose)
+              one per encoder stage, contributing ~0.55 ms total.
+
+  Swin-B    : 1x PatchEmbed (initial tokenisation) + 3x PatchMerging
+              (concatenate neighbouring tokens -> linear project) between
+              stages, contributing ~0.45 ms total.
+
+
+================================================================================
+ENCODER RECOMMENDATION
+================================================================================
+
+  SegFormer   8.23 ms  -- fastest by a wide margin; recommended if mIoU holds
+  ResNet-101 11.76 ms  -- slightly faster than ConvNeXt but bloated param count
+  ConvNeXt-B 12.30 ms  -- best large-model option; faster than Swin-B by ~6 ms
+  Swin-B     18.76 ms  -- slowest; hard to justify over ConvNeXt-B
+
+  Recommendation:
+    - If accuracy is competitive: go with SegFormer (fastest, lightest).
+    - If a large backbone is needed: ConvNeXt-B (12.3 ms, same accuracy
+      class as Swin-B but 35% faster, no tokenisation overhead).
+    - Avoid Swin-B: slowest with no accuracy advantage over ConvNeXt-B.
+    - Avoid ResNet-101: most of its 127.9 M params are in the UPerNet head,
+      not the backbone doing useful work.
+
+================================================================================
+PROFILING SETUP
+================================================================================
+
+  Hardware  : CUDA GPU
+  Input     : synthetic random tensors, 512x512, batch size 1
+  Runs      : 100 timed forward passes per model (+ 10 warmup batches)
+  Timing    : CUDA events (encoder and UPerNet timed separately via
+              torch.cuda.synchronize between stages)
+  Reshape   : measured via forward hooks on patch embedding / merging modules
+              + explicit timing of final F.interpolate upsample
+================================================================================
